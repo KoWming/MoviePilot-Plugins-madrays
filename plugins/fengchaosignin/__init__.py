@@ -15,6 +15,7 @@ from typing import Any, List, Dict, Tuple, Optional
 from app.log import logger
 from app.schemas import NotificationType
 from app.utils.http import RequestUtils
+from app.helper.browser import PlaywrightHelper
 
 
 class FengchaoSignin(_PluginBase):
@@ -25,7 +26,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "2.1.0"
+    plugin_version = "2.1.1"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -56,6 +57,7 @@ class FengchaoSignin(_PluginBase):
     _last_push_time = None  # 上次推送时间
     # 代理相关
     _use_proxy = True  # 是否使用代理，默认启用
+    _use_browser_emulation = False  # 是否启用浏览器仿真（引擎由系统 BROWSER_EMULATION 决定）
     # 用户名密码
     _username = None
     _password = None
@@ -93,6 +95,7 @@ class FengchaoSignin(_PluginBase):
             self._mp_push_enabled = config.get("mp_push_enabled", False)
             self._mp_push_interval = int(config.get("mp_push_interval", 1))
             self._use_proxy = config.get("use_proxy", True)
+            self._use_browser_emulation = config.get("use_browser_emulation", False)
             self._username = config.get("username", "")
             self._password = config.get("user_password", "")
             self._timed_update_enabled = config.get("timed_update_enabled", False)
@@ -189,6 +192,7 @@ class FengchaoSignin(_PluginBase):
             "mp_push_enabled": self._mp_push_enabled,
             "mp_push_interval": self._mp_push_interval,
             "use_proxy": self._use_proxy,
+            "use_browser_emulation": self._use_browser_emulation,
             "username": self._username,
             "user_password": self._password,
             "timed_update_enabled": self._timed_update_enabled,
@@ -344,6 +348,30 @@ class FengchaoSignin(_PluginBase):
             logger.error(f"获取代理设置出错: {str(e)}")
             return None
 
+    def _get_page_source(self, url: str, cookies: str = None) -> Optional[str]:
+        """
+        获取页面 HTML 源码。
+        若启用浏览器仿真，调用 PlaywrightHelper（内部自动按 settings.BROWSER_EMULATION
+        使用 playwright 或 flaresolverr 引擎）；否则走普通 HTTP 请求。
+        """
+        proxies = self._get_proxies()
+        proxy_server = settings.PROXY_SERVER if self._use_proxy else None
+
+        if self._use_browser_emulation:
+            logger.info(f"[浏览器仿真] 使用 {settings.BROWSER_EMULATION} 引擎请求: {url}")
+            return PlaywrightHelper().get_page_source(
+                url=url,
+                cookies=cookies,
+                proxies=proxy_server,
+                timeout=60
+            )
+
+        res = RequestUtils(cookies=cookies, proxies=proxies, timeout=30).get_res(url=url)
+        if res and res.status_code == 200:
+            return res.text
+        logger.error(f"普通请求失败: {url}, 状态码: {res.status_code if res else '无响应'}")
+        return None
+
     def __update_user_info(self, is_scheduled_run: bool = False):
         """
         仅更新用户信息，不执行签到
@@ -359,17 +387,17 @@ class FengchaoSignin(_PluginBase):
             if not cookie:
                 raise Exception("登录失败，无法获取Cookie")
 
-            res_main = None
             try:
-                res_main = RequestUtils(cookies=cookie, proxies=proxies, timeout=30).get_res(url="https://pting.club")
+                main_html = self._get_page_source("https://pting.club", cookies=cookie)
             except Exception as e:
                 logger.error(f"访问主页时发生网络错误: {e}")
                 raise Exception(f"访问主页失败: {e}")
 
-            if not res_main or res_main.status_code != 200:
-                raise Exception(f"访问主页失败，状态码: {res_main.status_code if res_main else 'N/A'}")
+            if not main_html:
+                raise Exception("访问主页失败，未获取到页面内容")
 
-            match = re.search(r'"userId":(\d+)', res_main.text)
+            match = re.search(r'"userId":(\d+)', main_html)
+
             if not match or match.group(1) == "0":
                 raise Exception("无法从主页获取有效的用户ID")
 
@@ -529,17 +557,17 @@ class FengchaoSignin(_PluginBase):
 
                 logger.info(f"登录成功，成功获取cookie")
 
-                # 使用获取的cookie访问蜂巢
+                # 使用获取的cookie访问蜂巢主页
                 try:
-                    res = RequestUtils(cookies=cookie, proxies=proxies, timeout=30).get_res(url="https://pting.club")
+                    page_html = self._get_page_source("https://pting.club", cookies=cookie)
                 except Exception as e:
                     logger.error(f"请求蜂巢出错: {str(e)}")
                     if attempt < max_retries:
                         continue
                     raise Exception("连接站点出错")
 
-                if not res or res.status_code != 200:
-                    logger.error(f"请求蜂巢返回错误状态码: {res.status_code if res else '无响应'}")
+                if not page_html:
+                    logger.error("请求蜂巢未获取到页面内容")
                     if attempt < max_retries:
                         continue
                     raise Exception("无法连接到站点")
@@ -547,10 +575,10 @@ class FengchaoSignin(_PluginBase):
                 pre_money = None
                 pre_days = None
                 try:
-                    pre_money_match = re.search(r'"money":\s*([\d.]+)', res.text)
+                    pre_money_match = re.search(r'"money":\s*([\d.]+)', page_html)
                     if pre_money_match:
                         pre_money = float(pre_money_match.group(1))
-                    pre_days_match = re.search(r'"totalContinuousCheckIn":\s*(\d+)', res.text)
+                    pre_days_match = re.search(r'"totalContinuousCheckIn":\s*(\d+)', page_html)
                     if pre_days_match:
                         pre_days = int(pre_days_match.group(1))
                     logger.info(f"签到前状态检查：当前花粉 -> {pre_money}, 签到天数 -> {pre_days}")
@@ -559,7 +587,7 @@ class FengchaoSignin(_PluginBase):
 
                 # 获取csrfToken
                 pattern = r'"csrfToken":"(.*?)"'
-                csrfToken = re.findall(pattern, res.text)
+                csrfToken = re.findall(pattern, page_html)
                 if not csrfToken:
                     logger.error("请求csrfToken失败")
                     if attempt < max_retries:
@@ -571,7 +599,7 @@ class FengchaoSignin(_PluginBase):
 
                 # 获取userid
                 pattern = r'"userId":(\d+)'
-                match = re.search(pattern, res.text)
+                match = re.search(pattern, page_html)
 
                 if match and match.group(1) != "0":
                     userId = match.group(1)
@@ -584,6 +612,7 @@ class FengchaoSignin(_PluginBase):
                     logger.error("未找到userId")
                     if attempt < max_retries:
                         continue
+
                     raise Exception("无法获取用户ID")
 
                 # 准备签到请求
@@ -949,10 +978,26 @@ class FengchaoSignin(_PluginBase):
                                                     {
                                                         'component': 'VSwitch',
                                                         'props': {
+                                                            'model': 'use_browser_emulation',
+                                                            'label': '启用浏览器仿真',
+                                                            'hint': '使用系统配置的仿真引擎绕过CF防护',
+                                                            'color': 'info',
+                                                            'persistent-hint': True
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {'cols': 12, 'md': 4},
+                                                'content': [
+                                                    {
+                                                        'component': 'VSwitch',
+                                                        'props': {
                                                             'model': 'update_info_now',
                                                             'label': '立即更新个人信息',
                                                             'hint': '不执行签到，仅刷新插件页面显示的用户信息',
-                                                            'color': 'info',
+                                                            'color': 'warning',
                                                             'persistent-hint': True
                                                         }
                                                     }
@@ -960,6 +1005,7 @@ class FengchaoSignin(_PluginBase):
                                             }
                                         ]
                                     },
+
                                     {
                                         'component': 'VRow',
                                         'content': [
